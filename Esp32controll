@@ -1,0 +1,1008 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Arduino.h>
+#include <Nextion.h>
+#include <Preferences.h>
+//#include <SPIFFS.h>
+#include <LittleFS.h>  // ✅ NEZAPOMEŇ: Přidat na začátek souboru!
+
+Preferences preferences;
+
+// Definice prvků z Nextion displeje - info z ESP
+NexText tTemp = NexText(2, 4, "tTemp");
+NexText tPower = NexText(2, 5, "tPower");
+NexText tGradient = NexText(2, 6, "tGradient");
+NexText tTargetTemp = NexText(2, 10, "tTargetTemp");
+NexText tTargetGrad = NexText(2, 11, "tTargetGrad");
+NexText tDelayTime = NexText(2, 38, "tDelayTime");  // Textový prvek na Nextion pro zbývající čas prodlevy
+NexText tUpdateInfo = NexText(2, 108, "tUpdateInfo");
+
+
+// Definice prvků z Nextion displeje - definice hodnot pro ESP
+NexNumber nTargetTemp = NexNumber(2, 20, "nTargetTemp");
+NexNumber nTargetTempDec = NexNumber(2, 19, "nTargetTempDec");
+NexNumber nTargetGrad = NexNumber(2, 18, "nTargetGrad");
+NexNumber nDelayTime = NexNumber(2, 7, "nDelayTime");  // Číselná hodnota prodlevy
+NexNumber nPWMcycle = NexNumber(2, 99, "nPWMcycle");
+NexNumber nMaxPower = NexNumber(2, 100, "nMaxPower");  // Přesné ID a page dle Nextion
+NexNumber nCoolRate = NexNumber(2, 98, "nCoolRate");
+
+// Definice prvků z Nextion displeje - aktivní ovládací prvky
+NexButton bStart = NexButton(2, 25, "bStart");
+NexButton bStop = NexButton(2, 27, "bStop");
+NexButton bSetTemp = NexButton(6, 4, "bSetTemp");
+NexButton bSetGrad = NexButton(7, 3, "bSetGrad");
+NexDSButton swAPI = NexDSButton(2, 16, "swAPI"); // Switch na stránce 2
+NexButton bSetInitValues = NexButton(3, 72, "bSetInitValues");  // Uložení settings
+NexButton bShowInit = NexButton(3, 103, "bShowInit");
+NexButton bRefresh = NexButton(2, 102, "bRefresh");
+NexButton bUpdateTFT = NexButton(3, 107, "bUpdateTFT");  // Přesná stránka a ID Nextion tlačítka
+
+
+// Pole s prvky pro nexLoop()
+NexTouch *nex_listen_list[] = {
+    &tTemp,
+    &tPower,
+    &tGradient,
+    &tTargetTemp,
+    &tTargetGrad,
+    &tDelayTime,
+    &nTargetTemp, 
+    &nTargetTempDec,
+    &nTargetGrad,
+    &nDelayTime,
+    &bStart,
+    &bStop,
+    &bSetTemp,
+    &bSetGrad,
+    &swAPI,
+    &nPWMcycle,
+    &bSetInitValues,
+    &nMaxPower,
+    &nCoolRate,
+    &bShowInit,
+    &bRefresh,
+    &bUpdateTFT,
+
+    NULL  // Ukončení pole
+};
+
+const char* ssid = "PancakoviV";
+const char* password = "8060180568Jp";
+//const char* ssid = "Xiaomi 13T Pro";
+//const char* password = "xsle4984";
+const char* tftUpdateUrl = "https://github.com/JirkaProfiBrew/Nextion/raw/refs/heads/main/ProfiBrewController.tft"; // link github
+const char* tftVersionUrl = "https://github.com/JirkaProfiBrew/Nextion/raw/refs/heads/main/version.txt";       // Malý txt se verzí
+const char* localTFTVersion = "1.0";  // Lokální verze TFT
+
+
+// 📡 API endpointy v Bubble
+const char* bubbleGetAPI = "https://panecto.com/version-test/api/1.1/obj/controller_command/1739630768554x789594921163105700";
+const char* bubblePostAPI = "https://panecto.com/version-test/api/1.1/wf/get_heater_status";
+
+
+#define HEATER_PIN 5  // GPIO pro topení
+#define GREEN_LED 4  // GPIO pro zelenou LED (topení zapnuté)
+#define RED_LED 5  // GPIO pro červenou LED (topení vypnuté)
+//#define PWM_CYCLE_MS 10000  // Jeden PWM cyklus = 10 sekund
+//#define MAX_HEAT_RATE 0.2  // Maximální nárůst teploty při 100 % výkonu
+//#define COOL_RATE 0.1       // Rychlost poklesu při vypnutém ohřevu
+#define POWER_ADJUST_STEP 5  // Krok úpravy výkonu v %
+#define NEXTION_SERIAL Serial2  // ESP32 používá UART2
+
+// Proměnné pro Preferences
+int PWM_CYCLE_MS = 10000; //výchozí hodnota
+float MAX_HEAT_RATE = 0.2;
+float COOL_RATE = 0.1;
+
+
+bool heatingActive = false;  // Řídí, zda má být ohřev aktivní
+bool lastPwmState = false; // 🆕 Poslední známý stav pwmState
+
+
+// Časovače pro jednotlivé úlohy
+unsigned long lastGradientUpdate = 0;
+unsigned long lastPowerAdjustment = 0; // Čas poslední úpravy výkonu
+unsigned long delayStartTime = 0;  // Čas spuštění prodlevy
+int remainingDelayTime = 0;  // Zbývající čas do konce prodlevy (v sekundách)
+unsigned long lastLEDUpdate = 0;
+unsigned long lastNextionUpdate = 0;
+unsigned long lastAPIUpdate = 0;
+
+
+// Časové intervaly pro jednotlivé úlohy
+const unsigned long GRADIENT_UPDATE_INTERVAL = 5000;  // 5 sekund - výpočet gradientu
+const unsigned long POWER_ADJUST_INTERVAL = 30000;    // 30 sekund - korekce výkonu
+const unsigned long LED_UPDATE_INTERVAL = 1000;       // 1 sekunda - aktualizace LED
+const unsigned long NEXTION_UPDATE_INTERVAL = 5000;   // 5 sekund - aktualizace displeje
+const unsigned long API_UPDATE_INTERVAL = 5000;       // 5 sekund - odesílání dat do API
+const unsigned long DELAY_INTERVAL = 60000;  // 1 minuta v milisekundách
+
+bool heaterState = false;
+bool delayActive = false;  // Indikuje, zda probíhá prodleva
+bool apiEnabled = false;  // Výchozí stav: API komunikace nepovolena
+float currentTemperature = 22.0;  
+float targetTemperature = 28.0;   
+float hysteresis = 0.5;           
+float temperatureGradient = 0.0;
+float targetGradient = 0.5;  // Požadovaný gradient °C/min
+int heaterPower = 100;  // Výchozí výkon v %
+
+unsigned long cycleStartTime = 0;
+bool pwmState = false;  // Stav topení v rámci PWM cyklu
+
+// 📊 **Cyklický buffer pro teploty z posledních 2 minut**
+const int TEMP_HISTORY_SIZE = 24;  // 2 minuty (120 sekund) / 5 sec = 24 vzorků
+float tempHistory[TEMP_HISTORY_SIZE] = {0};  // Pole pro ukládání teplot
+int tempIndex = 0;  // Aktuální pozice v bufferu
+bool bufferFilled = false;  // Kontroluje, zda už máme dost dat pro výpočet gradientu
+
+void setup() {
+    Serial.begin(115200);
+    NEXTION_SERIAL.begin(115200, SERIAL_8N1, 16, 17);  // RX=16, TX=17 pro ESP32
+    nexInit();  // Inicializace Nextion displeje
+    Serial.println("✅ Nextion displej připojen!");
+    
+    // Připojení callback funkcí pro tlačítka
+    bStart.attachPop(bStartPressCallback);
+    bStop.attachPop(bStopPressCallback);
+    bSetTemp.attachPop(bSetTempCallback);
+    bSetGrad.attachPop(bSetGradientCallback);
+    swAPI.attachPop(swAPICallback);
+    bSetInitValues.attachPop(bSetInitValuesCallback); 
+    bShowInit.attachPop(bShowInitCallback);
+    bRefresh.attachPop(bRefreshCallback);
+    bUpdateTFT.attachPop(bUpdateTFTCallback);
+
+    Serial.println("✅ Nextion tlačítka připojena!");
+  
+    //heaterPower = 100;  // Na začátku ohřev vždy na 100 %
+    pinMode(HEATER_PIN, OUTPUT);
+    pinMode(GREEN_LED, OUTPUT);
+    pinMode(RED_LED, OUTPUT);
+    digitalWrite(HEATER_PIN, LOW);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, LOW);
+
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\n✅ WiFi připojeno!");
+
+    loadSettings();  // Načti hodnoty z paměti při startu
+
+    if (!LittleFS.begin(true)) {
+    Serial.println("❌ Chyba při inicializaci LittleFS!");
+    }
+
+
+    nMaxPower.setValue((int)(MAX_HEAT_RATE * 10));
+
+
+  // 🆕 Aktualizace displeje hned po spuštění
+    updateNextionDisplay();
+    Serial.println("✅ Displej Nextion inicializován s aktuálními hodnotami.");
+}
+
+String formatTime(int seconds) {
+    int hours = seconds / 3600;
+    int minutes = (seconds % 3600) / 60;
+    int secs = seconds % 60;
+    
+    char timeStr[10];  // Buffer pro formátovaný řetězec
+    
+    if (hours > 0) {
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d", hours, minutes, secs); // hh:mm:ss
+    } else {
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d", minutes, secs); // mm:ss
+    }
+
+    return String(timeStr);
+}
+
+bool safeGetValue(NexNumber &nexNum, uint32_t *value) {
+    bool success = false;
+    for (int i = 0; i < 3; i++) {
+        success = nexNum.getValue(value);
+        if (success) break;
+        delay(50);
+    }
+    return success;
+}
+
+void loadSettings() {
+    preferences.begin("heater", true);
+    PWM_CYCLE_MS = preferences.getInt("PWM_CYCLE_MS", 10000);  // Načtení hodnoty, výchozí = 10000
+    MAX_HEAT_RATE = preferences.getFloat("MAX_HEAT_RATE", 0.2);
+    COOL_RATE = preferences.getFloat("COOL_RATE", 0.1);
+
+    preferences.end();
+}
+
+void saveSettings() {
+    preferences.begin("heater", false);
+    preferences.putInt("PWM_CYCLE_MS", PWM_CYCLE_MS);
+    preferences.putFloat("MAX_HEAT_RATE", MAX_HEAT_RATE);
+    preferences.putFloat("COOL_RATE", COOL_RATE);
+    preferences.end();
+}
+
+void loadInitValuesFromNextion() {
+    Serial.println("📥 Načítání hodnot z Nextion...");
+
+   delay(300);  // Umožní Nextionu načíst stránku s hodnotami
+
+    uint32_t pwmCycleValue = 0;
+    uint32_t maxRateRaw = 0;
+    uint32_t coolRateRaw = 0;
+
+    bool ok1 = false, ok2 = false, ok3 = false;
+for (int i = 0; i < 3; i++) {
+    if (!ok1) ok1 = nPWMcycle.getValue(&pwmCycleValue);
+    if (!ok2) ok2 = nMaxPower.getValue(&maxRateRaw);
+    if (!ok3) ok3 = nCoolRate.getValue(&coolRateRaw);
+    if (ok1 && ok2 && ok3) break;
+    delay(50);
+}
+
+
+    if (!ok1) {
+        Serial.println("⚠️ Nelze načíst nPWMcycle z Nextion!");
+    } else {
+        PWM_CYCLE_MS = pwmCycleValue * 1000;
+        Serial.print("✅ PWM_CYCLE_MS: "); Serial.println(PWM_CYCLE_MS);
+    }
+
+    if (!ok2) {
+        Serial.println("⚠️ Nelze načíst nMaxPower z Nextion!");
+    } else {
+        MAX_HEAT_RATE = maxRateRaw / 10.0;
+        Serial.print("✅ MAX_HEAT_RATE: "); Serial.println(MAX_HEAT_RATE);
+    }
+
+    if (!ok3) {
+        Serial.println("⚠️ Nelze načíst nCoolRate z Nextion!");
+    } else {
+        COOL_RATE = coolRateRaw / 10.0;
+        Serial.print("✅ COOL_RATE: "); Serial.println(COOL_RATE);
+    }
+}
+
+void updateInitValuesOnNextion() {
+    nPWMcycle.setValue(PWM_CYCLE_MS / 1000);
+    nMaxPower.setValue((int)(MAX_HEAT_RATE * 10));
+    nCoolRate.setValue((int)(COOL_RATE * 10));
+
+}
+
+void startHeating() {
+    Serial.println("🔥 START: Ohřev zapnut!");
+    heatingActive = true;  // Aktivujeme ohřev
+    heaterPower = 100;  // Po spuštění nastavíme výkon na 100%
+    cycleStartTime = millis();  // Resetujeme čas PWM cyklu
+    lastGradientUpdate = millis();
+    lastPowerAdjustment = millis();
+    lastLEDUpdate = millis();
+    lastNextionUpdate = millis();
+    lastAPIUpdate = millis();
+
+  // Okamžitá aktualizace displeje Nextion
+    updateNextionDisplay();
+}
+
+void stopHeating() {
+    Serial.println("🛑 STOP: Ohřev vypnut a čítače vynulovány.");
+    heatingActive = false;  // Deaktivujeme ohřev
+    heaterPower = 0;        // Nastavení výkonu na 0 %
+    heaterState = false;
+    cycleStartTime = 0;
+    digitalWrite(HEATER_PIN, LOW); // Fyzicky vypneme ohřev
+
+    // Vynulování gradientu a reset bufferu
+    temperatureGradient = 0.0;
+    bufferFilled = false;
+    tempIndex = 0;
+    for (int i = 0; i < TEMP_HISTORY_SIZE; i++) {
+        tempHistory[i] = 0;
+    }
+
+    // **🆕 Reset prodlevy**
+    delayActive = false;
+    remainingDelayTime = 0;
+    Serial.println("🕒 Prodleva vynulována.");
+
+    // Okamžitá aktualizace displeje Nextion
+    updateNextionDisplay();
+
+    Serial.println("⚡ Výkon nastaven na 0% | Gradient resetován");
+}
+
+void bSetInitValuesCallback(void *ptr) {
+    Serial.println("🟢 Nastavení inicializačních hodnot...");
+
+    // Přepneme na stránku Hand (page 2)
+    Serial2.print("page 2");
+    Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+    delay(500);  // Necháme načíst stránku
+
+    uint32_t pwmCycleVal = 0;
+    uint32_t maxRateVal = 0;
+    uint32_t coolRateVal = 0;
+
+    bool ok1 = safeGetValue(nPWMcycle, &pwmCycleVal);
+    bool ok2 = safeGetValue(nMaxPower, &maxRateVal);
+    bool ok3 = safeGetValue(nCoolRate, &coolRateVal);
+
+    if (!ok1) Serial.println("❌ Chyba: nPWMcycle se nepodařilo načíst.");
+    if (!ok2) Serial.println("❌ Chyba: nMaxPower se nepodařilo načíst.");
+    if (!ok3) Serial.println("❌ Chyba: nCoolRate se nepodařilo načíst.");
+
+    Serial.print("📋 Načtené hodnoty z Hand: PWM = ");
+    Serial.print(pwmCycleVal);
+    Serial.print(", MaxPower = ");
+    Serial.print(maxRateVal);
+    Serial.print(", CoolRate = ");
+    Serial.println(coolRateVal);
+
+    if (!ok1 || !ok2 || !ok3) {
+        Serial.println("❌ Nelze načíst jednu nebo více hodnot z Nextion (Hand stránka).");
+        return;
+    }
+
+    // Aktualizace hodnot v paměti
+    PWM_CYCLE_MS = pwmCycleVal * 1000;
+    MAX_HEAT_RATE = maxRateVal / 10.0;
+    COOL_RATE = coolRateVal / 10.0;
+
+    saveSettings();              // Uložíme změny do Preferences
+    updateInitValuesOnNextion();  // Aktualizujeme displej pro jistotu
+
+    Serial.println("✅ Inicializační hodnoty uloženy a zobrazeny.");
+}
+
+void bShowInitCallback(void *ptr) {
+    Serial.println("📟 Požadavek na zobrazení init hodnot z Preferences");
+    loadSettings();
+    updateInitValuesOnNextion();
+}
+
+void bUpdateTFTCallback(void *ptr) {
+    Serial.println("🔄 Stisknuto tlačítko Aktualizace TFT");
+    updateNextionTFT();
+}
+
+void bRefreshCallback(void *ptr) {
+    Serial.println("🔄 bRefreshCallback - aktualizace Nextion displeje");
+    updateNextionDisplay();
+}
+
+void bStartPressCallback(void *ptr) {
+    Serial.println("🟢 Stisknuto tlačítko START");
+    startHeating();
+}
+
+void bStopPressCallback(void *ptr) {
+    Serial.println("🔴 Stisknuto tlačítko STOP");
+    stopHeating();
+}
+
+void bSetTempCallback(void *ptr) {
+    Serial.println("📡 Pokus o načtení teploty z Nextionu...");
+
+    uint32_t wholePart = 0, decimalPart = 0;
+    bool ok1 = safeGetValue(nTargetTemp, &wholePart);
+    bool ok2 = safeGetValue(nTargetTempDec, &decimalPart);
+
+    if (!ok1 || !ok2) {
+        Serial.println("❌ Chyba při čtení teploty z Nextion displeje!");
+        return;
+    }
+
+    targetTemperature = wholePart + (decimalPart / 10.0);
+
+    Serial.print("🎯 Nastavená cílová teplota: ");
+    Serial.println(targetTemperature);
+
+    updateNextionDisplay();
+
+    if (apiEnabled) {
+        sendHeaterStatus();
+    }
+}
+
+void bSetGradientCallback(void *ptr) {
+    Serial.println("📡 Pokus o načtení gradientu z Nextionu...");
+
+    uint32_t gradientValue = 0;
+    bool ok = safeGetValue(nTargetGrad, &gradientValue);
+
+    if (!ok) {
+        Serial.println("❌ Chyba při čtení gradientu z Nextion displeje!");
+        return;
+    }
+
+    targetGradient = gradientValue / 10.0;
+
+    Serial.print("📊 Nastavený požadovaný gradient: ");
+    Serial.println(targetGradient);
+
+    //updateNextionDisplay();
+
+    if (apiEnabled) {
+        sendHeaterStatus();
+    }
+}
+
+void swAPICallback(void *ptr) {
+    uint32_t state;
+    swAPI.getValue(&state);  // Načteme stav switche (0 = vypnuto, 1 = zapnuto)
+
+    if (state == 1) {
+        apiEnabled = true;
+        Serial.println("✅ API komunikace zapnuta.");
+    } else {
+        apiEnabled = false;
+        Serial.println("❌ API komunikace vypnuta.");
+    }
+}
+
+void updateTemperature() {
+    if (heaterPower > 0) {
+        currentTemperature += (heaterPower / 100.0) * MAX_HEAT_RATE;
+    } else {
+        currentTemperature -= COOL_RATE;
+    }
+    Serial.print("🌡 Aktuální teplota: ");
+    Serial.print(currentTemperature);
+    Serial.println(" °C");
+
+   // 🔥 Okamžité zahájení prodlevy při dosažení teploty
+    if (currentTemperature >= targetTemperature && !delayActive) {
+        Serial.println("🎯 Cílová teplota dosažena, zahajuji prodlevu.");
+        startDelay();
+    }
+}
+
+void calculateTemperatureGradient() {
+    tempHistory[tempIndex] = currentTemperature;
+    int oldIndex = (tempIndex + 1) % TEMP_HISTORY_SIZE;
+    
+    if (!bufferFilled && oldIndex == 0) {
+        bufferFilled = true;
+    }
+
+    if (bufferFilled) {
+        float oldTemperature = tempHistory[oldIndex];  
+        temperatureGradient = (currentTemperature - oldTemperature) / 2.0;  // °C/min
+
+        Serial.print("📊 Gradient ohřevu: ");
+        Serial.print(temperatureGradient);
+        Serial.print(" °C/min | 🎯 Požadovaný gradient: ");
+        Serial.println(targetGradient);
+    } else {
+        Serial.println("⏳ Čekám na dostatek dat pro výpočet gradientu...");
+    }
+
+    tempIndex = (tempIndex + 1) % TEMP_HISTORY_SIZE;
+}
+
+void adjustHeaterPower() {
+    
+    if (!bufferFilled) {
+        Serial.println("⚠️ Gradient není znám, výkon ponechán na 100 %");
+        heaterPower = 100;  // Na začátku ohříváme naplno
+        return;
+    }
+
+    float gradientDifference = targetGradient - temperatureGradient;
+    float adjustment = gradientDifference * 15;  // Zvýšený koeficient pro rychlejší přizpůsobení
+
+    heaterPower += constrain(adjustment, -POWER_ADJUST_STEP * 2, POWER_ADJUST_STEP * 2);
+    heaterPower = constrain(heaterPower, 0, 100);
+
+    Serial.print("⚡ Upravený výkon: ");
+    Serial.print(heaterPower);
+    Serial.println(" %");
+
+}
+
+void controlHeaterPWM() {
+    unsigned long elapsedTime = millis() - cycleStartTime;
+    unsigned long onTime = (PWM_CYCLE_MS * heaterPower) / 100;
+    
+    if (heaterPower == 0) {
+        pwmState = false;
+    } else if (heaterPower == 100) {
+        pwmState = true;
+    } else {
+        pwmState = (elapsedTime < onTime);
+        if (elapsedTime >= PWM_CYCLE_MS) {
+            cycleStartTime = millis();
+        }
+    }
+
+    digitalWrite(HEATER_PIN, pwmState ? HIGH : LOW);
+    heaterState = (heaterPower > 0);
+
+  // 🆕 Aktualizace barvy tlačítka bPowerSignal POUZE při změně pwmState
+    if (pwmState != lastPwmState) {
+    if (pwmState) {
+        Serial2.print("bPowerSignal.bco=2016");
+    } else {
+        Serial2.print("bPowerSignal.bco=63488");
+    }
+    Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+    
+    lastPwmState = pwmState;  // Aktualizuj uložený stav
+    }
+}
+
+void startDelay() {
+    delayActive = true;
+    delayStartTime = millis();
+    
+    uint32_t delayValue = 0; // Proměnná pro uložení hodnoty prodlevy
+    bool success = false;
+    for (int i = 0; i < 3; i++) {  
+        success = nDelayTime.getValue(&delayValue);  
+        if (success) break;  
+        delay(50);  
+    }
+    if (!success) {
+        Serial.println("❌ Chyba při čtení hodnoty prodlevy z Nextion displeje!");
+        return;
+    }
+
+    remainingDelayTime = delayValue * 60; // Převod na sekundy
+    heaterPower = 0;  // Vypnutí ohřevu
+
+    Serial.print("🕒 Prodleva spuštěna na: ");
+    Serial.print(remainingDelayTime / 60);
+    Serial.println(" minut.");
+
+    // 🔄 Okamžitá aktualizace displeje Nextion
+    String delayCmd = "tDelayTime.txt=\"" + String(remainingDelayTime) + "s\"";
+    Serial2.print(delayCmd); Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+}
+
+void controlLED() {
+    if (heaterPower > 0) {
+        digitalWrite(GREEN_LED, pwmState ? LOW : HIGH);
+        digitalWrite(RED_LED, pwmState ? HIGH : LOW);
+    } else {
+        digitalWrite(GREEN_LED, HIGH);
+        digitalWrite(RED_LED, HIGH);
+    }
+}
+
+void updateNextionDisplay() {
+    String cmdTemp = "tTemp.txt=\"" + String(currentTemperature) + "\"";
+    String cmdPower = "tPower.txt=\"" + String(heaterPower) + " %\"";
+    String cmdGradient = "tGradient.txt=\"" + String(temperatureGradient) + "\"";
+    String cmdTargetTemp = "tTargetTemp.txt=\"" + String(targetTemperature, 1) + "\"";
+    String cmdTargetGrad = "tTargetGrad.txt=\"" + String(targetGradient, 1) + "\"";
+
+    Serial2.print(cmdTemp); Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+    Serial2.print(cmdPower); Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+    Serial2.print(cmdGradient); Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+    Serial2.print(cmdTargetTemp); Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+    Serial2.print(cmdTargetGrad); Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+
+    Serial.print("🌡 Teplota: ");
+    Serial.print(currentTemperature);
+    Serial.print(" °C | 🎯 Cíl: ");
+    Serial.print(targetTemperature);
+    Serial.print(" °C | 🔥 Stav: ");
+    Serial.print(heaterState ? "ON" : "OFF");
+    Serial.print(" | ⚡ Výkon: ");
+    Serial.print(heaterPower);
+    Serial.print(" % | 📊 Gradient: ");
+    Serial.print(temperatureGradient);
+    Serial.print(" °C/min | Pož. gradient: ");
+    Serial.print(targetGradient);
+    Serial.println(" °C/min");
+    Serial.print(" | MAX_HEAT_RATE: "); Serial.print(MAX_HEAT_RATE);
+    Serial.print(" | COOL_RATE: "); Serial.println(COOL_RATE);
+    Serial.print(" | PWM Stav: ");
+    Serial.println(pwmState ? "ON" : "OFF");
+    
+
+
+}
+
+void resetNextionAfterError() {
+    Serial.println("🔁 Resetuji Nextion po chybě...");
+    Serial2.print("rest");
+    Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+    delay(1000); // Pauza pro stabilizaci
+}
+
+bool downloadTFTFile(const char* url, const char* savePath) {
+  Serial.println("📥 Zahajuji stahování TFT souboru přes LittleFS...");
+
+  if (!LittleFS.begin(true)) {
+    Serial.println("❌ LittleFS inicializace selhala!");
+    return false;
+  }
+
+  // 🧹 Nejprve SMAZAT původní soubor
+  if (LittleFS.exists(savePath)) {
+    Serial.println("📂 Existující soubor nalezen, odstraňuji...");
+    if (LittleFS.remove(savePath)) {
+      Serial.println("✅ Soubor odstraněn.");
+    } else {
+      Serial.println("❌ Nepodařilo se odstranit soubor!");
+      return false;
+    }
+  } else {
+    Serial.println("📂 Původní soubor neexistoval.");
+  }
+
+  // 🧮 Poté zjistit nové volné místo
+  size_t totalBytes = LittleFS.totalBytes();
+  size_t usedBytes = LittleFS.usedBytes();
+  size_t freeSpace = totalBytes - usedBytes;
+
+  Serial.print("📦 Celkový prostor: "); Serial.println(totalBytes);
+  Serial.print("📦 Využito: "); Serial.println(usedBytes);
+  Serial.print("📦 Volné místo: "); Serial.println(freeSpace);
+
+  // 🌐 Připojit k serveru
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.print("❌ HTTP chyba: "); Serial.println(httpCode);
+    http.end();
+    return false;
+  }
+
+  int totalSize = http.getSize();
+  Serial.print("📄 Velikost souboru ke stažení: "); Serial.println(totalSize);
+
+  if (totalSize > freeSpace) {
+    Serial.println("❌ Nedostatek místa v LittleFS!");
+    http.end();
+    return false;
+  }
+
+  File tftFile = LittleFS.open(savePath, "w");
+  if (!tftFile) {
+    Serial.println("❌ Nelze otevřít soubor pro zápis!");
+    http.end();
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t buffer[1024];
+  int bytesDownloaded = 0;
+  int lastPercentReported = 0;
+  unsigned long lastWriteTime = millis();
+
+  Serial.println("📥 Zahajeno stahování souboru...");
+
+  while (http.connected() && bytesDownloaded < totalSize) {
+    size_t available = stream->available();
+    if (available) {
+      int bytesToRead = min(available, (size_t)1024);
+      int bytesRead = stream->readBytes(buffer, bytesToRead);
+
+      size_t bytesWritten = tftFile.write(buffer, bytesRead);
+      if (bytesWritten != bytesRead) {
+        Serial.println("❌ Chyba při zápisu do souboru!");
+        tftFile.close();
+        http.end();
+        return false;
+      }
+
+      bytesDownloaded += bytesRead;
+
+      if (millis() - lastWriteTime > 1000) {
+        tftFile.flush();
+        lastWriteTime = millis();
+      }
+
+      int percent = (bytesDownloaded * 100) / totalSize;
+      if (percent >= lastPercentReported + 10 || bytesDownloaded == totalSize) {
+        lastPercentReported = percent;
+        Serial.print("✅ Staženo: "); Serial.print(percent); Serial.println("%");
+      }
+    }
+    yield();
+  }
+
+  tftFile.flush();
+  tftFile.close();
+  http.end();
+
+  // 📋 Ověření souboru
+  File checkFile = LittleFS.open(savePath, "r");
+  if (!checkFile) {
+    Serial.println("❌ Nelze ověřit soubor po stažení!");
+    return false;
+  }
+  size_t fileSize = checkFile.size();
+  checkFile.close();
+
+  Serial.print("📦 Velikost uloženého souboru: ");
+  Serial.println(fileSize);
+
+  if (fileSize > 0 && (fileSize >= totalSize * 0.9)) {
+    Serial.println("🎉 Soubor stažen a uložen úspěšně!");
+    return true;
+  } else {
+    Serial.println("❌ Stažený soubor nesedí velikostí!");
+    return false;
+  }
+}
+
+void updateNextionTFT() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("❌ WiFi není připojeno!");
+        resetNextionAfterError();
+        return;
+    }
+
+    HTTPClient http;
+    http.begin(tftVersionUrl);
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode <= 0) {
+        Serial.println("❌ Chyba při načítání verze!");
+        http.end();
+        resetNextionAfterError();
+        return;
+    }
+
+    String serverVersion = http.getString();
+    serverVersion.trim();
+    Serial.print("🔎 Verze na serveru: "); Serial.println(serverVersion);
+
+    if (serverVersion == localTFTVersion) {
+        Serial.println("ℹ️ TFT je aktuální, není potřeba aktualizovat.");
+        http.end();
+        return;
+    }
+
+    http.end();
+
+    if (!downloadTFTFile(tftUpdateUrl, "/update.tft")) {
+        Serial.println("❌ Stažení souboru selhalo!");
+        resetNextionAfterError();
+        return;
+    }
+
+    File tftFile = LittleFS.open("/update.tft", FILE_READ);
+    if (!tftFile) {
+        Serial.println("❌ Chyba při otevření staženého souboru!");
+        resetNextionAfterError();
+        return;
+    }
+
+    size_t fileSize = tftFile.size();
+    Serial.print("📦 Velikost souboru: ");
+    Serial.println(fileSize);
+
+    // Přepnutí Nextionu do režimu aktualizace
+    Serial.println("📡 Přepínám Nextion do režimu aktualizace...");
+    Serial2.print("whmi-wri ");
+    Serial2.print(fileSize);
+    Serial2.print(",115200,0");
+    Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+
+    delay(3000);  // 🛠 Přidáno čekání 3 sekundy! Velmi důležité pro stabilitu.
+  
+    unsigned long startWait = millis();
+    bool ready = false;
+    while (millis() - startWait < 5000) {
+        if (Serial2.available()) {
+            uint8_t b = Serial2.read();
+            if (b == 0x05) {  // Ready
+                ready = true;
+                break;
+            }
+        }
+        delay(10);
+    }
+
+    if (!ready) {
+        Serial.println("❌ Nextion neodpověděl (0x05) - aktualizace zrušena");
+        tftFile.close();
+        resetNextionAfterError();
+        return;
+    }
+
+    // Odesílání souboru
+    Serial.println("📤 Posílám soubor do Nextion...");
+    uint8_t buf[512];
+    size_t bytesSent = 0;
+
+    while (tftFile.available()) {
+        size_t bytesRead = tftFile.readBytes((char*)buf, sizeof(buf));
+        Serial2.write(buf, bytesRead);
+        bytesSent += bytesRead;
+
+        if (bytesSent % 10240 < sizeof(buf)) {
+            Serial.print("Odesláno: ");
+            Serial.print(bytesSent);
+            Serial.print(" / ");
+            Serial.println(fileSize);
+        }
+
+        delay(5);
+    }
+
+    tftFile.close();
+    Serial.println("✅ Odesílání dokončeno, čekám na potvrzení...");
+
+    // Čekání na úspěch (0x05)
+    startWait = millis();
+    bool success = false;
+    while (millis() - startWait < 20000) {
+        if (Serial2.available()) {
+            uint8_t b = Serial2.read();
+            if (b == 0x05) {  // Success
+                success = true;
+                break;
+            }
+        }
+        delay(10);
+    }
+
+    if (success) {
+        Serial.println("🎉 Aktualizace TFT proběhla úspěšně!");
+    } else {
+        Serial.println("❌ Aktualizace se nezdařila!");
+        resetNextionAfterError();
+    }
+}
+
+
+void getControlData() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    http.begin(bubbleGetAPI);
+    int httpResponseCode = http.GET();
+
+    if (httpResponseCode > 0) {
+        String response = http.getString();
+        Serial.print("📥 Odpověď z Bubble: ");
+        Serial.println(response);
+
+        DynamicJsonDocument doc(1024);
+        DeserializationError error = deserializeJson(doc, response);
+
+        if (!error) {
+            if (doc.containsKey("response")) {
+                JsonObject resp = doc["response"];
+                
+                if (resp.containsKey("target_temperature")) {
+                    float newTemp = resp["target_temperature"];
+                    if (newTemp != targetTemperature) {
+                        targetTemperature = newTemp;
+                        Serial.print("🔄 Aktualizace cílové teploty z API: ");
+                        Serial.println(targetTemperature);
+                        updateNextionDisplay();
+                    }
+                }
+
+                if (resp.containsKey("target_gradient")) {
+                    float newGrad = resp["target_gradient"];
+                    if (newGrad != targetGradient) {
+                        targetGradient = newGrad;
+                        Serial.print("🔄 Aktualizace požadovaného gradientu z API: ");
+                        Serial.println(targetGradient);
+                        updateNextionDisplay();
+                    }
+                }
+            }
+        }
+    }
+    http.end();
+}
+
+void sendHeaterStatus() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    http.begin(bubblePostAPI);
+    http.addHeader("Content-Type", "application/json");
+
+    String jsonData;
+    StaticJsonDocument<256> doc;
+    doc["heater"] = heaterState;
+    doc["current_temperature"] = currentTemperature;
+    doc["target_temperature"] = targetTemperature;
+    doc["temperature_gradient"] = temperatureGradient;
+    doc["heater_power"] = heaterPower;
+
+    serializeJson(doc, jsonData);
+    http.POST(jsonData);
+    http.end();
+}
+
+void loop() {
+    unsigned long currentMillis = millis();
+
+  // Naslouchání událostem z Nextionu
+    nexLoop(nex_listen_list); 
+    
+    
+    if (heatingActive) { // Kód se spustí jen pokud je aktivní ohřev
+        // 📊 Vyhodnocení gradientu každých 5 sekund
+        if (currentMillis - lastGradientUpdate >= GRADIENT_UPDATE_INTERVAL) {
+            calculateTemperatureGradient();
+            lastGradientUpdate = currentMillis;
+        }
+
+        // 🔥 Korekce výkonu podle gradientu každých 30 sekund
+        if (currentMillis - lastPowerAdjustment >= POWER_ADJUST_INTERVAL) {
+            adjustHeaterPower();
+            lastPowerAdjustment = currentMillis;
+        }
+
+        // 💡 Aktualizace LED každou sekundu
+        if (currentMillis - lastLEDUpdate >= LED_UPDATE_INTERVAL) {
+            controlLED();
+            lastLEDUpdate = currentMillis;
+        }
+
+     if (delayActive) {
+    unsigned long elapsedDelay = (millis() - delayStartTime) / 1000;  // Doba od spuštění v sekundách
+
+    uint32_t delayValue = 0; // Proměnná pro uložení hodnoty prodlevy
+    bool success = nDelayTime.getValue(&delayValue);  // Načtení prodlevy v minutách
+
+    if (!success) {
+        Serial.println("❌ Chyba při čtení hodnoty prodlevy z Nextion displeje!");
+        return;
+    }
+
+    remainingDelayTime = (delayValue * 60) - elapsedDelay;
+
+    if (remainingDelayTime <= 0) {
+        delayActive = false;
+        Serial.println("✅ Prodleva skončila, přepínám na stránku pStepEnd.");
+        
+        // Přepnutí na stránku s ukončením kroku
+        Serial2.print("page 9"); Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+
+        // **🆕 Spuštění stopHeating()**
+        stopHeating();
+    } else {
+        // 🔹 **Použití nové funkce formatTime()**
+        String formattedTime = formatTime(remainingDelayTime);
+
+        Serial.print("🕒 Zbývající čas prodlevy: ");
+        Serial.println(formattedTime);
+
+        String delayCmd = "tDelayTime.txt=\"" + formattedTime + "\"";
+        Serial2.print(delayCmd); Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
+    }
+}
+
+
+        // 🔄 Aktualizace teploty a displeje Nextion každých 5 sekund
+        if (currentMillis - lastNextionUpdate >= NEXTION_UPDATE_INTERVAL) {
+            updateTemperature();
+            updateNextionDisplay();
+            lastNextionUpdate = currentMillis;
+        }
+
+        // 📡 Získávání dat z API každých 5 sekund
+        if (apiEnabled && currentMillis - lastAPIUpdate >= API_UPDATE_INTERVAL) {
+        getControlData();
+        sendHeaterStatus();
+        lastAPIUpdate = currentMillis;
+        }
+
+        // 🔥 Řízení ohřevu (PWM cyklus běží nezávisle)
+        controlHeaterPWM();
+    }
+}
